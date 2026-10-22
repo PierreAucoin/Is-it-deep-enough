@@ -1,0 +1,315 @@
+---
+title: "SMT Data Challenge"
+output:
+  pdf_document: default
+  html_document: default
+date: "2026-05-05"
+---
+```{r}
+source("SMT_Data_starter.R")
+library(broom)
+```
+
+```{r}
+lineups<-filter(lineups,inning<=8)
+# A few lineups have batters be NA, this fixes that.
+for (i in seq(1,nrow(lineups)-1)){
+  if(is.na(lineups[i+1,"batter"])){
+    if(lineups[i+1,"at_bat"]==lineups[i,"at_bat"]){
+      lineups[i+1,"batter"]=lineups[i,"batter"]
+    }
+  }
+}
+```
+```{r}
+# To determine outs, start by grouping plays based on base state.
+ball_events_data=ball_events%>%
+  filter(!is.na(game_string))%>%
+  collect()
+lineups$outs=0
+lineups<-lineups%>%
+  group_by(game_string,inning,half_inning,batter,on_1b,on_2b,on_3b)%>%
+  filter(play_per_game==max(play_per_game)&game_string%in%ball_events_data$game_string)%>%
+  ungroup()
+for (i in seq(1,nrow(lineups))){
+  out=FALSE
+  if(i==nrow(lineups)) lineups[[i,"outs"]]=2
+  # We know if the half-inning or game changes, the first one will have 0 outs
+  else if(lineups[[i,"half_inning"]]!=lineups[[i+1,"half_inning"]]|lineups[[i,"game_string"]]!=lineups[[i+1,"game_string"]]) {
+    lineups[[i+1,"outs"]]=0
+    next}
+  # If there is a pickoff, and a player on base disappears, we assume there was an out.
+  else if (lineups[i,"is_pickoff"]==TRUE&(!lineups[i,"on_1b"]%in%c(lineups[i+1,"on_1b"],lineups[i+1,"on_2b"],lineups[i+1,"on_3b"])|!lineups[i+1,"on_2b"]%in%c(lineups[i+1,"on_2b"],lineups[i+1,"on_3b"]))){
+    lineups[[i+1,"outs"]]=lineups[[i+1,"outs"]]+1
+  }
+  else{
+    # Now if there is a home run, then we know there were no outs
+    play=ball_events_data%>%filter(game_string==lineups[[i,"game_string"]]&play_per_game==lineups[[i,"play_per_game"]])
+    if(11%in%play$ball_eventcode){
+      lineups[[i+1,"outs"]]=lineups[[i,"outs"]]
+      next
+    }
+    # If the batter does not appear on base and there wasn't a home run, I assume there is an out
+    else if (lineups[[i,"batter"]]!=lineups[[i+1,"batter"]]&(!lineups[i,"batter"]%in%c(lineups[i+1,"on_1b"],lineups[i+1,"on_2b"],lineups[i+1,"on_3b"]))){
+      lineups[[i+1,"outs"]]=lineups[[i,"outs"]]+1
+      out<-TRUE
+    }
+    else{
+      lineups[[i+1,"outs"]]=lineups[[i,"outs"]]
+    }
+  }
+  # I'm assuming on an out, no one is scoring from first or second, so if a player disappears, then I assume it's a double play
+  if(out==TRUE &(!lineups[i,"on_1b"]%in%c(lineups[i+1,"on_1b"],lineups[i+1,"on_2b"],lineups[i+1,"on_3b"]))){
+    lineups[[i+1,"outs"]]=lineups[[i+1,"outs"]]+1
+  }
+  if(out==TRUE &(!lineups[i,"on_2b"]%in%c(lineups[i+1,"on_2b"],lineups[i+1,"on_3b"]))&!is.na(lineups[i,"on_2b"])){
+    lineups[[i+1,"outs"]]=lineups[[i+1,"outs"]]+1
+  }
+}
+# Using full_data for Sniper metric calculation
+full_data<-lineups
+full_data$play_game_id<-paste0(full_data$game_string,full_data$play_per_game)
+```
+
+```{r}
+# Now filter out sac flies only to determine what plays to look at.
+# Add play_game_id to make it easier to filter through specific plays.
+lineups<-lineups%>%filter(!is.na(on_3b)&outs<2)
+
+lineups$play_game_id<-paste0(lineups$game_string,lineups$play_per_game)
+
+ball_events_data<-ball_events_data%>%
+  mutate(play_game_id=paste0(game_string,play_per_game))%>%
+  filter(play_game_id%in%full_data$play_game_id)
+
+ball_positions_data=ball_positions%>%
+  mutate(play_game_id=paste0(game_string,play_per_game))%>%
+  filter(play_game_id%in%full_data$play_game_id)%>%
+  collect()
+
+player_positions_data<-player_positions%>%
+  mutate(play_game_id=paste0(game_string,play_per_game))%>%
+  filter(play_game_id%in%lineups$play_game_id)%>%
+  collect()
+```
+
+```{r}
+# Get distance for key throws to home
+ball_events_throws <- ball_events_data %>%
+  group_by(game_string, play_per_game) %>%
+  filter(((player_id == 7|player_id == 9|player_id == 8) & ball_eventcode == 3 & 
+  ((lead(player_id) == 2 & lead(ball_eventcode) == 2)|(lead(ball_eventcode)==16&lead(player_id,2) == 2 & lead(ball_eventcode,2) == 2)))) %>%
+  ungroup() %>% 
+  select(game_string, play_per_game, player_id, ball_eventcode, throw_timestamp =timestamp,play_game_id)
+```
+```{r}
+# Get catches for those throws
+ball_events_catch <- ball_events_data %>%
+# I removed two catches that was caused by multiple throws to home on the same play, with the second one in both situations not being by an outfielder.
+  filter(player_id==2&ball_eventcode==2&play_game_id%in%ball_events_throws$play_game_id&timestamp!=8251948&timestamp!=4322623)%>%
+  select(game_string, play_per_game, player_id, ball_eventcode, catch_timestamp = timestamp,play_game_id)
+```
+```{r}
+# Figure out what player threw and caught the ball using ball_events_throws
+ball_events_throws$fielding_id<-" "
+ball_events_catch$catch_id<-" "
+ball_events_throws$on_first<-0
+ball_events_throws$on_second<-0
+for(i in seq(1:nrow(ball_events_throws))){
+  key_row<-full_data%>%
+    filter(play_game_id==ball_events_throws[[i,"play_game_id"]])
+  if(nrow(key_row)==0) next
+  if(ball_events_throws[[i,"player_id"]]==7){
+    ball_events_throws[i,"fielding_id"]=key_row[1,"left_fielder"]
+  }
+  if(ball_events_throws[[i,"player_id"]]==8){
+    ball_events_throws[i,"fielding_id"]=key_row[1,"center_fielder"]
+  }
+  if(ball_events_throws[[i,"player_id"]]==9){
+    ball_events_throws[i,"fielding_id"]=key_row[1,"right_fielder"]
+  }
+  if(!is.na(key_row[i,"on_1b"])){
+    ball_events_throws[i,"on_first"]=1
+  }
+  if(!is.na(key_row[i,"on_2b"])){
+    ball_events_throws[i,"on_second"]=1
+  }
+}
+
+for(i in seq(1:nrow(ball_events_catch))){
+  key_row<-full_data%>%
+    filter(play_per_game==ball_events_catch[[i,"play_per_game"]]&game_string==ball_events_catch[[i,"game_string"]])
+  if(nrow(key_row)==0) next
+  ball_events_catch[i,"catch_id"]=key_row[1,"catcher"]
+
+}
+
+  
+```
+
+
+```{r}
+# Get the ball location data for the plays we need
+ball_locations<- ball_positions_data%>%
+  filter(
+  (play_game_id%in%ball_events_throws$play_game_id))%>%
+  select(-c(home_team, away_team, year, day))
+for (i in seq(1,nrow(ball_events_throws))){
+  key_row_One<-ball_events_throws[i,]
+  key_row_Two<-filter(ball_events_catch,play_game_id==key_row_One$play_game_id)
+  ball_locations<-ball_locations%>%
+    filter(!(play_game_id==key_row_One$play_game_id&(timestamp>key_row_Two$catch_timestamp|timestamp<key_row_One$throw_timestamp)))
+}
+```
+
+```{r}
+# Get the distance thrown
+dthrown <- ball_locations %>%
+  # Convert ball_position coordinates to numeric
+  mutate(ball_position_x = as.numeric(ball_position_x),
+         ball_position_y = as.numeric(ball_position_y),
+         ball_position_z = as.numeric(ball_position_z),
+         timestamp=as.numeric(timestamp)) %>%
+  # Group by play
+  group_by(game_string, play_per_game) %>%
+    # Find change_x, change_y and change_time and distance traveled
+    mutate(change_x = ball_position_x - lag(ball_position_x),
+           change_y = ball_position_y - lag(ball_position_y),
+           change_z = ball_position_z - lag(ball_position_z),
+           # Find front corner and use this for dist_off_plate
+           dist_off_plate=sqrt((ball_position_x+8.5/12)^2+(ball_position_y-17/12)^2),
+           change_time_ms = timestamp - lag(timestamp),
+           # Convert change_time_ms to seconds
+           change_time_sec = change_time_ms / 1000,
+           distance_thrown = sqrt(change_x^2 + change_y^2+change_z^2),
+           # Get velocity for Sniper calculation
+           velo=(distance_thrown+lag(distance_thrown))/(change_time_sec+lag(change_time_sec)),
+           total_distance_thrown=sum(distance_thrown,na.rm=TRUE),
+           # We only need max velocity (right after throw)
+           max_velo=max(velo,na.rm=TRUE))%>%
+          filter(timestamp==max(timestamp))%>%
+  ungroup()%>%
+  mutate(distance_thrown=total_distance_thrown,
+         velo=max_velo)
+# Get which player threw the ball
+dthrown$player<-" "
+for (i in seq(1,nrow(dthrown))){
+  data<-ball_events_throws%>%
+  filter(play_game_id==dthrown[[i,"play_game_id"]])
+  dthrown[i,"player"]=data$fielding_id
+}
+```
+
+```{r}
+# Time to do running speed in a similar method to throwing speed
+runner_positions_data<-player_positions_data%>%
+  filter(player_id==13&(timestamp %in% ball_events_catch$catch_timestamp|timestamp %in% ball_events_throws$throw_timestamp)&
+  (play_per_game %in% ball_events_catch$play_per_game|play_per_game %in% ball_events_throws$play_per_game)&
+    (game_string %in% ball_events_catch$game_string|game_string %in% ball_events_throws$game_string))%>%
+  select(-c(home_team, away_team, year, day))
+
+```
+
+```{r}
+# Get the runners pace per 90 ft
+dran<-runner_positions_data%>%
+  mutate(field_x = as.numeric(field_x),
+         field_y = as.numeric(field_y),
+         timestamp=as.numeric(timestamp)) %>%
+  group_by(player_id,play_per_game,game_string)%>%
+  mutate(change_x = field_x - lag(field_x),
+           change_y = field_y - lag(field_y),
+           change_time_ms = timestamp - lag(timestamp),
+           # Convert change_time_ms to seconds
+           change_time_sec = change_time_ms / 1000,
+           distance_ran = sqrt(change_x^2 + change_y^2))%>%
+          ungroup()%>%
+  filter(!is.na(change_time_sec))
+  
+dran$player<-" "
+dran$sac_fly=0
+for (i in seq(1,nrow(dran))){
+  key_row<-lineups%>%
+    filter(play_per_game==dran[[i,"play_per_game"]]&game_string==dran[[i,"game_string"]])
+  dran[i,"player"]=key_row[1,"on_3b"]
+  # This checks to see if at the moment the catcher catchers the ball, whether the runner passed home
+  if(dran[[i,"field_x"]]<=-8.5/12&dran[[i,"field_y"]]>=17/12){
+    dran[i,"sac_fly"]=1
+  }
+}
+# Calculate the runners pace per ninety feet
+dran<-dran%>%
+  mutate(pace_per_ninety=(change_time_sec/distance_ran)*90)
+dran_test<-dran%>%
+  group_by(player)%>%
+  mutate(min_pace=quantile(pace_per_ninety,.9))%>%
+  filter(pace_per_ninety>=min_pace)%>%
+  mutate(speed=mean(pace_per_ninety))%>%
+  ungroup()%>%
+  distinct(player,speed)%>%
+  #removed player due to having extreme outlier (pace of 279)
+  filter(player!="ARN-9747")
+
+for (i in seq(1,nrow(dran))){
+  key<-dran_test%>%
+    filter(player==dran[[i,"player"]])
+  dran[i,"pace_per_ninety"]=key[1,"speed"]
+}
+# From here only look at thrown plays that are sacrifice flies.
+dthrown_sac<-dthrown%>%
+  filter(paste0(play_game_id,timestamp)%in%paste0(dran$play_game_id,dran$timestamp))
+```
+
+```{r}
+# Time to build Sniper metric
+Sniper_data<-dthrown%>%
+  group_by(player)%>%
+  # Only use throws where 90th percentile for velo
+  mutate(min_power=quantile(velo,0.9))%>%
+  filter(velo>=min_power)%>%
+  mutate(Power=mean(velo),Accuracy=mean(dist_off_plate))%>%
+  ungroup()%>%
+  # Center and scale the data
+  mutate(Power=scale(Power),Accuracy=scale(Accuracy))%>%
+  distinct()%>%
+  select(player,Power,Accuracy)
+pca_data<-Sniper_data%>%
+  select(Power,Accuracy)
+
+# Use PCA to get the coefficients in one dimension
+pca<-prcomp(pca_data)
+summary(pca)
+coeff<-pca$rotation
+PowerC<-coeff["Power","PC1"]
+AccuracyC<-coeff["Accuracy","PC1"]
+Sniper_data<-Sniper_data%>%
+  mutate(Sniper=Power*PowerC+Accuracy*AccuracyC)
+```
+
+```{r}
+# Assign Sniper metric to each players throws
+dthrown_sac$sniper<-0
+for (i in seq(1,nrow(dthrown_sac))){
+  key<-Sniper_data%>%
+    filter(player==dthrown_sac[[i,"player"]])
+  dthrown_sac[i,"sniper"]=key[1,"Power"]*PowerC+key[1,"Accuracy"]*AccuracyC
+}
+# Join dran and dthrown_sac to get all metrics needed
+model_data<-left_join(dran,dthrown_sac,by=c("play_game_id","timestamp"))
+
+model_data<-model_data%>%  
+  select(sac_fly,sniper,distance_thrown,pace_per_ninety,dist_off_plate)
+# Use logistic regression to get the model coefficients
+primary_model<-glm(sac_fly~sniper+distance_thrown+pace_per_ninety, data=model_data,family=binomial)
+summary(primary_model)
+values<-primary_model$coefficients
+# Saved as csv to be used by the Shiny app
+write.csv(dran_test,"dran_values.csv")
+write.csv(Sniper_data,"sniper_data.csv")
+write.csv(values,"model_coefficients.csv")
+
+parameters<-tidy(primary_model)
+write.csv(parameters,"model_summary.csv")
+```
+
+
